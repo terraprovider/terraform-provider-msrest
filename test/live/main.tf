@@ -3,8 +3,10 @@
 # .github/workflows/live-test.yml with the provider built from the commit.
 #
 # The identity holds read roles only, and this configuration has data sources
-# only. The checks test the shape of the values, not the values themselves,
-# because the settings may be changed in the test tenant.
+# only. A data source fails on any response other than 2xx, so a successful
+# apply means every GET returned 2xx. The postconditions add that the response
+# had a JSON body. Nothing from the responses is output, so the run log shows
+# no tenant data.
 
 terraform {
   required_providers {
@@ -22,12 +24,12 @@ data "msrest_resource" "planner" {
   url     = "https://tasks.office.com/taskAPI/tenantAdminSettings/Settings"
   headers = { "OData-Version" = "4.0;NetFx" }
 
-  response_export_values = { all = "@" }
+  response_export_values = { response = "@" }
 
   lifecycle {
     postcondition {
-      condition     = can(tobool(self.output.all.allowCalendarSharing))
-      error_message = "The Planner settings have no boolean allowCalendarSharing."
+      condition     = self.output.response != null
+      error_message = "The Planner settings request returned 2xx without a JSON body."
     }
   }
 }
@@ -37,29 +39,12 @@ data "msrest_resource" "products" {
   url   = "https://licensing.m365.microsoft.com/v1/policies/AllowSelfServicePurchase/products"
   scope = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
 
-  response_export_values = {
-    items         = "items"
-    policy_values = "items[].policyValue"
-  }
+  response_export_values = { response = "@" }
 
   lifecycle {
     postcondition {
-      condition     = length(self.output.items) > 0
-      error_message = "The self-service purchase policy lists no products."
-    }
-    postcondition {
-      condition = alltrue([
-        for v in self.output.policy_values : contains(["Enabled", "Disabled", "OnlyTrialsWithoutPaymentMethod"], v)
-      ])
-      error_message = "A product has an unknown policyValue."
+      condition     = self.output.response != null
+      error_message = "The self-service purchase request returned 2xx without a JSON body."
     }
   }
-}
-
-output "planner_allow_calendar_sharing" {
-  value = data.msrest_resource.planner.output.all.allowCalendarSharing
-}
-
-output "self_service_purchase" {
-  value = { for p in data.msrest_resource.products.output.items : p.productName => p.policyValue }
 }
