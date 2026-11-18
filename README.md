@@ -92,7 +92,12 @@ go vet ./...
 gofmt -l .
 # Unit and mock-API tests. They need terraform or tofu; with OpenTofu:
 TF_ACC_TERRAFORM_PATH=$(which tofu) TF_ACC_PROVIDER_HOST=registry.opentofu.org go test -race ./...
+# Registry documentation in docs/, from the schemas and examples/ (tfplugindocs).
+# It needs terraform on PATH; with aqua, point aqua at the repository's config:
+(cd tools && AQUA_GLOBAL_CONFIG=$PWD/../aqua/aqua.yml go generate ./...)
 ```
+
+CI fails if `docs/` is out of date, so commit regenerated docs with every schema or example change.
 
 To try a local build, point a CLI config file at the build directory:
 

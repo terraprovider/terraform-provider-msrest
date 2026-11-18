@@ -51,6 +51,31 @@
       "algorithm": "sha256"
     },
     {
+      "id": "http/releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_darwin_amd64.zip",
+      "checksum": "66B472DCC36CF770D83757ED4D002C476174842C05C68637B40A7E99519CF3E1",
+      "algorithm": "sha256"
+    },
+    {
+      "id": "http/releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_darwin_arm64.zip",
+      "checksum": "DA0C7EF278A911347862758E7573A5907365E66485C2637CF5C217C5E227992E",
+      "algorithm": "sha256"
+    },
+    {
+      "id": "http/releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_linux_amd64.zip",
+      "checksum": "E6F16B2F0B137EE5729CAA8C4E79A3BAE4EE261ACD198A1FCFA8584A6296605B",
+      "algorithm": "sha256"
+    },
+    {
+      "id": "http/releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_linux_arm64.zip",
+      "checksum": "858E08C181A76B6B223E8C767A8E983922EEBE2D062DB949A2DE66CE040C368C",
+      "algorithm": "sha256"
+    },
+    {
+      "id": "http/releases.hashicorp.com/terraform/1.17.2/terraform_1.17.2_windows_amd64.zip",
+      "checksum": "2244B7A379EA8C4B224A2EAB411B7288F41EF36316FCA27AE4B51B1CF2A53024",
+      "algorithm": "sha256"
+    },
+    {
       "id": "registries/github_content/github.com/aquaproj/aqua-registry/v4.530.0/registry.yaml",
       "checksum": "43CC45E1A514E4375608A8614CC44987EC04A5865980404D3DADBC245CF9006D",
       "algorithm": "sha256"

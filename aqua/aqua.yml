@@ -12,3 +12,4 @@ registries:
 packages:
   - name: goreleaser/goreleaser@v2.16.0
   - name: opentofu/opentofu@v1.13.9
+  - name: hashicorp/terraform@v1.17.2

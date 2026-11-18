@@ -30,10 +30,49 @@ jobs:
 
       - name: gofmt (check)
         run: |
-          out=$(gofmt -l $(git ls-files '*.go'))
+          out=$(gofmt -l .)
           if [ -n "$out" ]; then echo "::error::gofmt needed:"; echo "$out"; exit 1; fi
 
       # The mock-API resource tests run through terraform; terraform-plugin-testing
       # downloads it when TF_ACC_TERRAFORM_PATH is not set.
       - name: go test
         run: go test -race ./...
+
+  # The registry documentation in docs/ is generated from the schemas and
+  # examples by tfplugindocs (tools/); Terraform for it is pinned in aqua.
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      # tfplugindocs runs terraform in a temporary directory outside the
+      # repository, where aqua would not find aqua/aqua.yml on its own.
+      AQUA_GLOBAL_CONFIG: ${{ github.workspace }}/aqua/aqua.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install aqua (pins Terraform)
+        uses: aquaproj/aqua-installer@82d0e83878a8657c4a6f2ff1755d3bfbfc67f329 # v4.1.0
+        with:
+          aqua_version: v2.53.4
+        env:
+          AQUA_GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Generate docs
+        run: cd tools && go generate ./...
+
+      - name: Verify docs are up to date
+        run: |
+          git diff --exit-code -- docs/ examples/ || {
+            echo "::error::docs/ is out of date; run 'cd tools && go generate ./...' and commit";
+            exit 1;
+          }
+          if [ -n "$(git status --porcelain -- docs/)" ]; then
+            echo "::error::docs/ has files that are not committed; run 'cd tools && go generate ./...' and commit";
+            exit 1;
+          fi
