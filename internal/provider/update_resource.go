@@ -151,6 +151,7 @@ func (r *updateResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Computed: true,
 				MarkdownDescription: "The values selected by `response_export_values` from the last read, as an HCL object " +
 					"(for example `msrest_update_resource.x.output.all`). An empty object when `response_export_values` is not set.",
+				PlanModifiers: []planmodifier.Dynamic{outputWithoutExports{}},
 			},
 		},
 	}
@@ -273,7 +274,12 @@ func (r *updateResource) write(ctx context.Context, m *updateResourceModel, diag
 				"the next plan shows a diff on body until the change has propagated or if the API ignored a value.",
 				timeout, m.readURL()))
 	}
+	// Without response_export_values the plan has output = {}, so set it even
+	// when nothing could be read back.
 	m.Output = types.DynamicNull()
+	if len(queries) == 0 {
+		m.Output = emptyOutput(ctx)
+	}
 	if seen {
 		if missing := missingPaths(desired, last); len(missing) > 0 {
 			diags.AddAttributeWarning(path.Root("body"), "Properties not returned by the API",
@@ -460,4 +466,36 @@ func stringMap(ctx context.Context, m types.Map) (map[string]string, diag.Diagno
 func isThrottled(err error) bool {
 	var ae *httpx.APIError
 	return errors.As(err, &ae) && ae.Status == http.StatusTooManyRequests
+}
+
+// emptyOutput is output without response_export_values: an empty object.
+func emptyOutput(ctx context.Context) types.Dynamic {
+	v, _ := exportValues(ctx, nil, nil)
+	return v
+}
+
+// outputWithoutExports plans output as an empty object when
+// response_export_values is unset or empty, since that is all an apply can
+// produce. Otherwise output stays unknown on create and update, because the
+// exported values come from the response.
+type outputWithoutExports struct{}
+
+func (outputWithoutExports) Description(context.Context) string {
+	return "An empty object when response_export_values is not set."
+}
+
+func (m outputWithoutExports) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (outputWithoutExports) PlanModifyDynamic(ctx context.Context, req planmodifier.DynamicRequest, resp *planmodifier.DynamicResponse) {
+	if req.Plan.Raw.IsNull() || !req.PlanValue.IsUnknown() {
+		return
+	}
+	var queries types.Map
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("response_export_values"), &queries)...)
+	if resp.Diagnostics.HasError() || queries.IsUnknown() || len(queries.Elements()) > 0 {
+		return
+	}
+	resp.PlanValue = emptyOutput(ctx)
 }
