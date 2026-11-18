@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
@@ -305,6 +306,13 @@ func TestUpdateResourcePlanner(t *testing.T) {
 			{
 				Config: plannerConfig(srv.URL, true),
 				Check:  api.checkValue(plannerPath, "allowCalendarSharing", true),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(plannerAddr, plancheck.ResourceActionUpdate),
+						// The exported values come from the response.
+						plancheck.ExpectUnknownValue(plannerAddr, tfjsonpath.New("output")),
+					},
+				},
 			},
 			{
 				Config: plannerConfig(srv.URL, false),
@@ -320,19 +328,27 @@ func TestUpdateResourcePlanner(t *testing.T) {
 	})
 }
 
+const purchaseAddr = "msrest_update_resource.purchase[0]"
+
 func TestUpdateResourceSelfServicePurchase(t *testing.T) {
 	api, srv := newMockAPI(t)
-	config := providerBlock + fmt.Sprintf(`
+	config := func(value string) string {
+		return providerBlock + fmt.Sprintf(`
 resource "msrest_update_resource" "purchase" {
   count         = 2
   url           = "%s%sP${count.index + 1}"
   scope         = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
   update_method = "PUT"
-  body          = { policyValue = "Disabled" }
+  body          = { policyValue = %q }
   delete_method = "PUT"
   delete_body   = { policyValue = "Enabled" }
 }
-`, srv.URL, purchaseBase)
+`, srv.URL, purchaseBase, value)
+	}
+	// Without response_export_values, output is an empty object, known at plan time.
+	emptyOutput := []plancheck.PlanCheck{
+		plancheck.ExpectKnownValue(purchaseAddr, tfjsonpath.New("output"), knownvalue.ObjectExact(map[string]knownvalue.Check{})),
+	}
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories,
@@ -343,15 +359,36 @@ resource "msrest_update_resource" "purchase" {
 		),
 		Steps: []resource.TestStep{
 			{
-				Config: config,
+				Config: config("Disabled"),
 				Check: resource.ComposeTestCheckFunc(
 					api.checkValue(purchaseBase+"P1", "policyValue", "Disabled"),
 					api.checkValue(purchaseBase+"P2", "policyValue", "Disabled"),
 				),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: emptyOutput},
 				ConfigStateChecks: []statecheck.StateCheck{
-					// Without response_export_values, output is an empty object.
-					statecheck.ExpectKnownValue("msrest_update_resource.purchase[0]", tfjsonpath.New("output"),
+					statecheck.ExpectKnownValue(purchaseAddr, tfjsonpath.New("output"),
 						knownvalue.ObjectExact(map[string]knownvalue.Check{})),
+				},
+			},
+			{
+				// An in-place update plans output = {}, not (known after apply).
+				Config: config("OnlyTrialsWithoutPaymentMethod"),
+				Check:  api.checkValue(purchaseBase+"P1", "policyValue", "OnlyTrialsWithoutPaymentMethod"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: append([]plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(purchaseAddr, plancheck.ResourceActionUpdate),
+					}, emptyOutput...),
+				},
+			},
+			{
+				// The same after drift.
+				PreConfig: func() { api.set(purchaseBase+"P1", "policyValue", "Enabled") },
+				Config:    config("OnlyTrialsWithoutPaymentMethod"),
+				Check:     api.checkValue(purchaseBase+"P1", "policyValue", "OnlyTrialsWithoutPaymentMethod"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: append([]plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(purchaseAddr, plancheck.ResourceActionUpdate),
+					}, emptyOutput...),
 				},
 			},
 		},
