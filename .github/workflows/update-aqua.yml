@@ -1,0 +1,81 @@
+name: Update aqua
+
+# Bumps the aqua registry, the tools in aqua/aqua.yml (GoReleaser, OpenTofu,
+# Terraform) and aqua itself (.github/actions/setup-aqua) to their latest
+# versions, refreshes aqua/aqua-checksums.json, and opens a pull request.
+#
+# Started by hand only (Actions > Update aqua > Run workflow). The pull request
+# is created with GITHUB_TOKEN, so no checks run on it automatically; its body
+# says how to run them. Major versions are included: review a GoReleaser bump
+# as a change to the release artifacts.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: update-aqua
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the update branch
+      pull-requests: write # open the pull request
+    env:
+      GH_TOKEN: ${{ github.token }}
+      AQUA_GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Skip if an update is already open
+        id: open
+        run: |
+          n=$(gh pr list --state open --json headRefName --jq '[.[] | select(.headRefName | startswith("autoupdate/aqua"))] | length')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" != "0" ]; then
+            echo "::notice::An aqua update pull request is already open; merge or close it first."
+          fi
+
+      - name: Install aqua
+        if: steps.open.outputs.count == '0'
+        uses: $/.github/actions/setup-aqua
+
+      - name: Update the pins and checksums
+        if: steps.open.outputs.count == '0'
+        run: |
+          aqua update -c aqua/aqua.yml
+          latest=$(gh release view -R aquaproj/aqua --json tagName --jq .tagName)
+          sed -i -E "s/(aqua_version: )v[0-9]+\.[0-9]+\.[0-9]+/\1${latest}/" .github/actions/setup-aqua/action.yml
+          aqua update-checksum -c aqua/aqua.yml --prune
+
+      - name: Open a pull request
+        if: steps.open.outputs.count == '0'
+        run: |
+          if git diff --quiet; then
+            echo "::notice::All aqua pins are up to date."
+            exit 0
+          fi
+          branch="autoupdate/aqua-$(date -u +%Y%m%d)"
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -a -m "chore: update aqua pins"
+          git push origin "$branch"
+          {
+            echo "Updates the aqua pins to their latest versions (Update aqua workflow)."
+            echo
+            echo '```diff'
+            git diff HEAD~1 -- aqua/aqua.yml .github/actions/setup-aqua/action.yml
+            echo '```'
+            echo
+            echo "No checks run on this pull request automatically, because GITHUB_TOKEN created it. Before merging:"
+            echo
+            echo "- Close and reopen it to run Test and Live test."
+            echo "- Run Build on the branch: \`gh workflow run build.yml --ref $branch\` (or Actions > Build > Run workflow)."
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --base main --head "$branch" --title "Update aqua pins" --body-file "$RUNNER_TEMP/body.md"

@@ -1,8 +1,9 @@
 version: 2
 
 # Dependency update automation, grouped so routine updates arrive as a few
-# reviewable PRs rather than one per dependency. The aqua pins (aqua/aqua.yml)
-# are not covered by Dependabot.
+# reviewable PRs rather than one per dependency. The aqua pins (aqua/aqua.yml
+# and the aqua version in .github/actions/setup-aqua) are not covered by
+# Dependabot; the Update aqua workflow bumps them.
 updates:
   # Provider Go module.
   - package-ecosystem: gomod
@@ -25,9 +26,26 @@ updates:
           - minor
           - patch
 
-  # GitHub Actions used by the workflows (all SHA-pinned).
+  # Documentation tooling module (tfplugindocs).
+  - package-ecosystem: gomod
+    directory: "/tools"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      tools:
+        patterns:
+          - "*"
+
+  # GitHub Actions used by the workflows and by the composite action in
+  # .github/actions (all SHA-pinned). Dependabot only finds .github/workflows
+  # on its own, so the action's directory is named directly.
   - package-ecosystem: github-actions
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/setup-aqua"
     schedule:
       interval: weekly
     cooldown:

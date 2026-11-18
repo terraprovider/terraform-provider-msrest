@@ -1,0 +1,14 @@
+name: Set up aqua
+description: >-
+  Installs aqua, which provides the tools pinned in aqua/aqua.yml (GoReleaser,
+  OpenTofu, Terraform). The aqua version is set only here; the Update aqua
+  workflow bumps it together with aqua/aqua.yml, and Dependabot bumps the
+  installer action.
+runs:
+  using: composite
+  steps:
+    - uses: aquaproj/aqua-installer@82d0e83878a8657c4a6f2ff1755d3bfbfc67f329 # v4.1.0
+      with:
+        aqua_version: v2.53.4
+      env:
+        AQUA_GITHUB_TOKEN: ${{ github.token }}
