@@ -2,9 +2,10 @@ name: Live test
 
 # Runs the provider built from this commit against the toydaria test tenant,
 # signing in with a federated identity credential (OIDC). Read-only: the app in
-# the repository variables LIVE_TEST_TENANT_ID and LIVE_TEST_CLIENT_ID holds
-# read roles only, and test/live has data sources only. The state stays on the
-# runner and is discarded with it.
+# the repository secrets ARM_TENANT_ID and ARM_CLIENT_ID holds read roles only,
+# and test/live has data sources only. Nothing from the responses is printed,
+# and the state stays on the runner and is discarded with it. Secrets rather
+# than variables, so the IDs are masked in the public run logs.
 #
 # The app's federated credentials trust main and pull requests of this
 # repository, in the immutable subject format the repository issues:
@@ -30,14 +31,14 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     env:
-      ARM_TENANT_ID: ${{ vars.LIVE_TEST_TENANT_ID }}
-      ARM_CLIENT_ID: ${{ vars.LIVE_TEST_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
       TF_IN_AUTOMATION: "true"
     steps:
-      - name: Check the repository variables
+      - name: Check the repository secrets
         run: |
           if [ -z "$ARM_TENANT_ID" ] || [ -z "$ARM_CLIENT_ID" ]; then
-            echo "::error::Set the repository variables LIVE_TEST_TENANT_ID and LIVE_TEST_CLIENT_ID."
+            echo "::error::Set the repository secrets ARM_TENANT_ID and ARM_CLIENT_ID."
             exit 1
           fi
 
