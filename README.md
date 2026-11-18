@@ -118,7 +118,7 @@ The Live test workflow (`.github/workflows/live-test.yml`) builds the provider f
 ### Dependencies
 
 - **Dependabot** (`.github/dependabot.yml`) opens weekly, grouped PRs for the Go modules (root and `tools/`) and the SHA-pinned GitHub Actions, including the aqua installer in `.github/actions/setup-aqua`.
-- **aqua pins** (`aqua/aqua.yml`: registry, GoReleaser, OpenTofu, Terraform; and the aqua version in `.github/actions/setup-aqua`) are not covered by Dependabot. Start the Update aqua workflow by hand (Actions > Update aqua > Run workflow). It bumps everything to the latest version, refreshes `aqua/aqua-checksums.json` and opens a PR. Because `GITHUB_TOKEN` creates that PR, no checks run on it automatically: close and reopen it to run Test and Live test, and run Build on its branch, before merging.
+- **aqua pins** (`aqua/aqua.yml`: registry, GoReleaser, OpenTofu, Terraform; and the aqua version in `.github/actions/setup-aqua`) are not covered by Dependabot. The Update aqua workflow runs weekly (Monday 06:00 UTC) and on demand (Actions > Update aqua > Run workflow). It bumps everything to the latest version, refreshes `aqua/aqua-checksums.json` and opens a PR. Because `GITHUB_TOKEN` creates that PR, no checks run on it automatically: close and reopen it to run Test and Live test, and run Build on its branch, before merging.
 
 ### Releases
 

@@ -4,11 +4,13 @@ name: Update aqua
 # Terraform) and aqua itself (.github/actions/setup-aqua) to their latest
 # versions, refreshes aqua/aqua-checksums.json, and opens a pull request.
 #
-# Started by hand only (Actions > Update aqua > Run workflow). The pull request
-# is created with GITHUB_TOKEN, so no checks run on it automatically; its body
-# says how to run them. Major versions are included: review a GoReleaser bump
-# as a change to the release artifacts.
+# Runs weekly (Monday 06:00 UTC) and on demand (Actions > Update aqua > Run
+# workflow). The pull request is created with GITHUB_TOKEN, so no checks run
+# on it automatically; its body says how to run them. Major versions are
+# included: review a GoReleaser bump as a change to the release artifacts.
 on:
+  schedule:
+    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 permissions: {}
