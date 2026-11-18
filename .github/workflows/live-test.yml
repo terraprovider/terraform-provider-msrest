@@ -51,10 +51,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+      - name: Install aqua (pins OpenTofu)
+        uses: aquaproj/aqua-installer@82d0e83878a8657c4a6f2ff1755d3bfbfc67f329 # v4.1.0
         with:
-          tofu_version: 1.13.9
-          tofu_wrapper: false
+          aqua_version: v2.53.4
+        env:
+          AQUA_GITHUB_TOKEN: ${{ github.token }}
 
       - name: Build the provider
         run: go build -trimpath -ldflags "-X main.version=0.0.0-live-test" -o "$RUNNER_TEMP/msrest-bin/terraform-provider-msrest" .
