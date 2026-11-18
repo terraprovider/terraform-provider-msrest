@@ -1,0 +1,33 @@
+name: Build
+
+# Validates that the release build compiles for every target platform, on every
+# push, via a goreleaser snapshot (no signing, no publishing).
+on: [workflow_dispatch, push]
+
+permissions:
+  contents: read
+
+jobs:
+  goreleaser-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install aqua (pins goreleaser)
+        uses: aquaproj/aqua-installer@82d0e83878a8657c4a6f2ff1755d3bfbfc67f329 # v4.1.0
+        with:
+          aqua_version: v2.53.4
+        env:
+          AQUA_GITHUB_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: GoReleaser (snapshot build)
+        run: goreleaser build --clean --snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
