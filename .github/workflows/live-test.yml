@@ -1,0 +1,75 @@
+name: Live test
+
+# Runs the provider built from this commit against the toydaria test tenant,
+# signing in with a federated identity credential (OIDC). Read-only: the app in
+# the repository variables LIVE_TEST_TENANT_ID and LIVE_TEST_CLIENT_ID holds
+# read roles only, and test/live has data sources only. The state stays on the
+# runner and is discarded with it.
+#
+# The app's federated credentials trust main and pull requests of this
+# repository, in the immutable subject format the repository issues:
+# repo:terraprovider@177577864/terraform-provider-msrest@1461800443:ref:refs/heads/main
+# and ...:pull_request. Pull requests from forks get no OIDC token and are skipped.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # request the GitHub OIDC token
+
+concurrency:
+  group: live-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live-test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      ARM_TENANT_ID: ${{ vars.LIVE_TEST_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ vars.LIVE_TEST_CLIENT_ID }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - name: Check the repository variables
+        run: |
+          if [ -z "$ARM_TENANT_ID" ] || [ -z "$ARM_CLIENT_ID" ]; then
+            echo "::error::Set the repository variables LIVE_TEST_TENANT_ID and LIVE_TEST_CLIENT_ID."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: 1.13.9
+          tofu_wrapper: false
+
+      - name: Build the provider
+        run: go build -trimpath -ldflags "-X main.version=0.0.0-live-test" -o "$RUNNER_TEMP/msrest-bin/terraform-provider-msrest" .
+
+      # dev_overrides makes OpenTofu use the build without init or signature.
+      - name: Read the test tenant with OIDC
+        working-directory: test/live
+        env:
+          TF_CLI_CONFIG_FILE: ${{ runner.temp }}/dev.tofurc
+        run: |
+          cat > "$TF_CLI_CONFIG_FILE" <<EOF
+          provider_installation {
+            dev_overrides {
+              "registry.opentofu.org/terraprovider/msrest" = "$RUNNER_TEMP/msrest-bin"
+            }
+            direct {}
+          }
+          EOF
+          tofu apply -auto-approve -input=false
