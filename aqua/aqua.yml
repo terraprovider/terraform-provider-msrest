@@ -1,0 +1,13 @@
+---
+# aqua - Declarative CLI Version Manager
+# https://aquaproj.github.io/
+checksum:
+  # Enable Checksum Verification
+  # https://aquaproj.github.io/docs/tutorial-extras/checksum/
+  enabled: true
+  require_checksum: true
+registries:
+  - type: standard
+    ref: v4.530.0 # renovate: depName=aquaproj/aqua-registry
+packages:
+  - name: goreleaser/goreleaser@v2.16.0
