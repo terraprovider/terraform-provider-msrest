@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +14,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 	"github.com/terraprovider/go-msadmin/retry"
 )
 
@@ -33,7 +35,20 @@ func init() {
 	retryConfig = retry.Config{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
 }
 
-const plannerPath = "/taskAPI/tenantAdminSettings/Settings"
+const (
+	plannerPath  = "/taskAPI/tenantAdminSettings/Settings"
+	nestedPath   = "/nested"
+	plannerAddr  = "msrest_update_resource.planner"
+	purchaseBase = "/v1/policies/AllowSelfServicePurchase/products/"
+)
+
+// recordedRequest is a request the mock API received, with its body.
+type recordedRequest struct {
+	method string
+	path   string
+	header http.Header
+	body   string
+}
 
 // mockAPI is a minimal settings API: GET reads an object, PATCH merges into it,
 // PUT sets the given properties, DELETE removes it. After each write it serves
@@ -45,7 +60,7 @@ type mockAPI struct {
 	stale     map[string]map[string]any
 	staleLeft map[string]int
 	lag       int
-	requests  []*http.Request
+	requests  []recordedRequest
 	failWith  string // if set, writes fail with this 400 body
 	throttle  int    // answer this many upcoming GETs with 429
 	throttled int    // number of 429s sent
@@ -60,8 +75,13 @@ func newMockAPI(t *testing.T) (*mockAPI, *httptest.Server) {
 				"isPlannerAllowed":     true,
 				"allowCalendarSharing": true,
 			},
-			"/v1/policies/AllowSelfServicePurchase/products/P1": {"productId": "P1", "productName": "Product 1", "policyValue": "Enabled"},
-			"/v1/policies/AllowSelfServicePurchase/products/P2": {"productId": "P2", "productName": "Product 2", "policyValue": "Enabled"},
+			purchaseBase + "P1": {"productId": "P1", "productName": "Product 1", "policyValue": "Enabled"},
+			purchaseBase + "P2": {"productId": "P2", "productName": "Product 2", "policyValue": "Enabled"},
+			nestedPath: {
+				"settings": map[string]any{"a": 1.0, "list": []any{"x", "y"}, "extra": "unmanaged"},
+				"ratio":    0.5,
+				"flag":     true,
+			},
 		},
 		stale:     map[string]map[string]any{},
 		staleLeft: map[string]int{},
@@ -82,7 +102,8 @@ func clone(o map[string]any) map[string]any {
 func (m *mockAPI) serve(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.requests = append(m.requests, r.Clone(r.Context()))
+	data, _ := io.ReadAll(r.Body)
+	m.requests = append(m.requests, recordedRequest{r.Method, r.URL.Path, r.Header.Clone(), string(data)})
 	if r.Header.Get("Authorization") != "Bearer test-token" {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
@@ -119,7 +140,7 @@ func (m *mockAPI) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := json.Unmarshal(data, &body); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -162,10 +183,13 @@ func (m *mockAPI) remove(path string) {
 	delete(m.objects, path)
 }
 
+// checkValue compares a property of an object, as JSON.
 func (m *mockAPI) checkValue(path, key string, want any) resource.TestCheckFunc {
 	return func(*terraform.State) error {
-		if got := m.get(path, key); got != want {
-			return fmt.Errorf("%s %s = %v, want %v", path, key, got, want)
+		got, _ := json.Marshal(m.get(path, key))
+		w, _ := json.Marshal(want)
+		if string(got) != string(w) {
+			return fmt.Errorf("%s %s = %s, want %s", path, key, got, w)
 		}
 		return nil
 	}
@@ -176,11 +200,37 @@ func (m *mockAPI) checkHeader(method, key, want string) resource.TestCheckFunc {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		for _, r := range m.requests {
-			if r.Method == method && r.Header.Get(key) == want {
+			if r.method == method && r.header.Get(key) == want {
 				return nil
 			}
 		}
 		return fmt.Errorf("no %s request with %s: %s", method, key, want)
+	}
+}
+
+// lastRequest returns the last request with the given method.
+func (m *mockAPI) lastRequest(method string) (recordedRequest, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.requests) - 1; i >= 0; i-- {
+		if m.requests[i].method == method {
+			return m.requests[i], true
+		}
+	}
+	return recordedRequest{}, false
+}
+
+// checkLastBody compares the raw body of the last request with the given method.
+func (m *mockAPI) checkLastBody(method, want string) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		r, ok := m.lastRequest(method)
+		if !ok {
+			return fmt.Errorf("no %s request", method)
+		}
+		if r.body != want {
+			return fmt.Errorf("%s body = %q, want %q", method, r.body, want)
+		}
+		return nil
 	}
 }
 
@@ -192,15 +242,20 @@ provider "msrest" {
 
 func plannerConfig(base string, allowCalendarSharing bool) string {
 	return providerBlock + fmt.Sprintf(`
-resource "msrest_object" "planner" {
+resource "msrest_update_resource" "planner" {
   url     = "%s%s"
   headers = { "OData-Version" = "4.0;NetFx" }
-  body    = jsonencode({ allowCalendarSharing = %t })
+  body    = { allowCalendarSharing = %t }
+
+  response_export_values = {
+    all     = "@"
+    sharing = "allowCalendarSharing"
+  }
 }
 `, base, plannerPath, allowCalendarSharing)
 }
 
-func TestObjectResourcePlanner(t *testing.T) {
+func TestUpdateResourcePlanner(t *testing.T) {
 	api, srv := newMockAPI(t)
 	api.lag = 3 // the first reads after a write still return the old value
 	url := srv.URL + plannerPath
@@ -215,19 +270,19 @@ func TestObjectResourcePlanner(t *testing.T) {
 			{
 				Config: plannerConfig(srv.URL, false),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("msrest_object.planner", "id", url),
-					resource.TestCheckResourceAttr("msrest_object.planner", "method", "PATCH"),
-					resource.TestCheckResourceAttr("msrest_object.planner", "body", `{"allowCalendarSharing":false}`),
-					resource.TestCheckResourceAttrWith("msrest_object.planner", "response", func(v string) error {
-						if !strings.Contains(v, `"allowCalendarSharing":false`) || !strings.Contains(v, `"isPlannerAllowed":true`) {
-							return fmt.Errorf("unexpected response %s", v)
-						}
-						return nil
-					}),
+					resource.TestCheckResourceAttr(plannerAddr, "id", url),
+					resource.TestCheckResourceAttr(plannerAddr, "update_method", "PATCH"),
 					api.checkValue(plannerPath, "allowCalendarSharing", false),
+					api.checkLastBody(http.MethodPatch, `{"allowCalendarSharing":false}`),
 					api.checkHeader(http.MethodPatch, "OData-Version", "4.0;NetFx"),
 					api.checkHeader(http.MethodPatch, "Content-Type", "application/json"),
 				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(plannerAddr, tfjsonpath.New("body"),
+						knownvalue.ObjectExact(map[string]knownvalue.Check{"allowCalendarSharing": knownvalue.Bool(false)})),
+					statecheck.ExpectKnownValue(plannerAddr, tfjsonpath.New("output").AtMapKey("sharing"), knownvalue.Bool(false)),
+					statecheck.ExpectKnownValue(plannerAddr, tfjsonpath.New("output").AtMapKey("all").AtMapKey("isPlannerAllowed"), knownvalue.Bool(true)),
+				},
 			},
 			{
 				// A change made outside of Terraform shows up as drift ...
@@ -255,49 +310,148 @@ func TestObjectResourcePlanner(t *testing.T) {
 				Config: plannerConfig(srv.URL, false),
 			},
 			{
-				ResourceName:            "msrest_object.planner",
+				ResourceName:            plannerAddr,
 				ImportState:             true,
 				ImportStateId:           url,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"body", "headers", "response"},
+				ImportStateVerifyIgnore: []string{"body", "headers", "response_export_values", "output"},
 			},
 		},
 	})
 }
 
-func TestObjectResourceSelfServicePurchase(t *testing.T) {
+func TestUpdateResourceSelfServicePurchase(t *testing.T) {
 	api, srv := newMockAPI(t)
 	config := providerBlock + fmt.Sprintf(`
-resource "msrest_object" "purchase" {
+resource "msrest_update_resource" "purchase" {
   count         = 2
-  url           = "%s/v1/policies/AllowSelfServicePurchase/products/P${count.index + 1}"
+  url           = "%s%sP${count.index + 1}"
   scope         = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
-  method        = "PUT"
-  body          = jsonencode({ policyValue = "Disabled" })
+  update_method = "PUT"
+  body          = { policyValue = "Disabled" }
   delete_method = "PUT"
-  delete_body   = jsonencode({ policyValue = "Enabled" })
+  delete_body   = { policyValue = "Enabled" }
 }
-`, srv.URL)
+`, srv.URL, purchaseBase)
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories,
 		CheckDestroy: resource.ComposeTestCheckFunc(
-			api.checkValue("/v1/policies/AllowSelfServicePurchase/products/P1", "policyValue", "Enabled"),
-			api.checkValue("/v1/policies/AllowSelfServicePurchase/products/P2", "policyValue", "Enabled"),
+			api.checkValue(purchaseBase+"P1", "policyValue", "Enabled"),
+			api.checkValue(purchaseBase+"P2", "policyValue", "Enabled"),
+			api.checkLastBody(http.MethodPut, `{"policyValue":"Enabled"}`),
 		),
 		Steps: []resource.TestStep{
 			{
 				Config: config,
 				Check: resource.ComposeTestCheckFunc(
-					api.checkValue("/v1/policies/AllowSelfServicePurchase/products/P1", "policyValue", "Disabled"),
-					api.checkValue("/v1/policies/AllowSelfServicePurchase/products/P2", "policyValue", "Disabled"),
+					api.checkValue(purchaseBase+"P1", "policyValue", "Disabled"),
+					api.checkValue(purchaseBase+"P2", "policyValue", "Disabled"),
 				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					// Without response_export_values, output is an empty object.
+					statecheck.ExpectKnownValue("msrest_update_resource.purchase[0]", tfjsonpath.New("output"),
+						knownvalue.ObjectExact(map[string]knownvalue.Check{})),
+				},
 			},
 		},
 	})
 }
 
-func TestObjectResourceGoneIsRecreated(t *testing.T) {
+// A body with nested objects, a list and numbers: no diff after the apply (the
+// HCL types of the configuration are kept), drift in a nested value is found,
+// and numbers are sent without exponent or trailing zeros.
+func TestUpdateResourceNestedBody(t *testing.T) {
+	api, srv := newMockAPI(t)
+	config := providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "nested" {
+  url  = "%s%s"
+  body = {
+    settings = { a = 2000000, list = ["x", "z"] }
+    ratio    = 0.25
+  }
+}
+`, srv.URL, nestedPath)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeTestCheckFunc(
+					api.checkLastBody(http.MethodPatch, `{"ratio":0.25,"settings":{"a":2000000,"list":["x","z"]}}`),
+					api.checkValue(nestedPath, "ratio", 0.25),
+				),
+			},
+			{
+				PreConfig: func() {
+					api.set(nestedPath, "settings", map[string]any{"a": 2000000.0, "list": []any{"x", "changed"}, "extra": "unmanaged"})
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check:  api.checkValue(nestedPath, "settings", map[string]any{"a": 2000000, "list": []any{"x", "z"}}),
+			},
+		},
+	})
+}
+
+// A body that is not known until apply (it references another resource).
+func TestUpdateResourceUnknownBody(t *testing.T) {
+	api, srv := newMockAPI(t)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: providerBlock + fmt.Sprintf(`
+resource "terraform_data" "flag" {
+  input = false
+}
+
+resource "msrest_update_resource" "planner" {
+  url  = "%s%s"
+  body = { allowCalendarSharing = terraform_data.flag.output }
+}
+`, srv.URL, plannerPath),
+				Check: api.checkValue(plannerPath, "allowCalendarSharing", false),
+			},
+		},
+	})
+}
+
+// delete_method without delete_body sends a request without a body.
+func TestUpdateResourceDeleteWithoutBody(t *testing.T) {
+	api, srv := newMockAPI(t)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		CheckDestroy: func(*terraform.State) error {
+			r, ok := api.lastRequest(http.MethodDelete)
+			if !ok {
+				return fmt.Errorf("no DELETE request")
+			}
+			if r.body != "" || r.header.Get("Content-Type") != "" {
+				return fmt.Errorf("DELETE sent body %q with Content-Type %q, want neither", r.body, r.header.Get("Content-Type"))
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "planner" {
+  url           = "%s%s"
+  body          = { allowCalendarSharing = false }
+  delete_method = "DELETE"
+}
+`, srv.URL, plannerPath),
+			},
+		},
+	})
+}
+
+func TestUpdateResourceGoneIsRecreated(t *testing.T) {
 	api, srv := newMockAPI(t)
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories,
@@ -313,7 +467,7 @@ func TestObjectResourceGoneIsRecreated(t *testing.T) {
 	})
 }
 
-func TestObjectResourceWriteError(t *testing.T) {
+func TestUpdateResourceWriteError(t *testing.T) {
 	api, srv := newMockAPI(t)
 	api.failWith = `{"error":{"code":"BadRequest","message":"Invalid value for allowCalendarSharing"}}`
 	resource.UnitTest(t, resource.TestCase{
@@ -327,61 +481,80 @@ func TestObjectResourceWriteError(t *testing.T) {
 	})
 }
 
-func TestObjectResourceValidation(t *testing.T) {
+func TestUpdateResourceValidation(t *testing.T) {
+	step := func(body, extra, wantErr string) resource.TestStep {
+		return resource.TestStep{
+			Config: providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "x" {
+  url  = "https://example.com/x"
+  body = %s
+  %s
+}`, body, extra),
+			ExpectError: regexp.MustCompile(wantErr),
+		}
+	}
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories,
 		Steps: []resource.TestStep{
+			step(`jsonencode({ a = 1 })`, "", `not\s+a\s+JSON\s+string`),
+			step(`1`, "", `Invalid body`),
+			step(`{}`, `delete_body = {}`, `delete_method`),
+			step(`{}`, `delete_method = "DELETE"`+"\n"+`delete_body = "x"`, `Invalid body`),
+			step(`{}`, `response_export_values = { x = "a[" }`, `Invalid\s+JMESPath\s+expression`),
 			{
 				Config: providerBlock + `
-resource "msrest_object" "x" {
-  url  = "https://example.com/x"
-  body = "{not json"
-}`,
-				ExpectError: regexp.MustCompile(`Invalid JSON`),
-			},
-			{
-				Config: providerBlock + `
-resource "msrest_object" "x" {
+resource "msrest_update_resource" "x" {
   url  = "example.com/x"
-  body = "{}"
+  body = {}
 }`,
 				ExpectError: regexp.MustCompile(`Invalid URL`),
-			},
-			{
-				Config: providerBlock + `
-resource "msrest_object" "x" {
-  url         = "https://example.com/x"
-  body        = "{}"
-  delete_body = "{}"
-}`,
-				ExpectError: regexp.MustCompile(`delete_method`),
 			},
 		},
 	})
 }
 
-func TestObjectDataSource(t *testing.T) {
+func TestResourceDataSource(t *testing.T) {
 	_, srv := newMockAPI(t)
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config: providerBlock + fmt.Sprintf(`
-data "msrest_object" "planner" {
-  url = "%s%s"
+data "msrest_resource" "planner" {
+  url = "%[1]s%[2]s"
+
+  response_export_values = {
+    all     = "@"
+    sharing = "allowCalendarSharing"
+  }
+}
+
+data "msrest_resource" "bare" {
+  url = "%[1]s%[2]s"
 }
 
 output "allow_calendar_sharing" {
-  value = jsondecode(data.msrest_object.planner.response).allowCalendarSharing
+  value = data.msrest_resource.planner.output.sharing
+}
+
+output "planner_allowed" {
+  value = data.msrest_resource.planner.output.all.isPlannerAllowed
 }
 `, srv.URL, plannerPath),
-				Check: resource.TestCheckOutput("allow_calendar_sharing", "true"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckOutput("allow_calendar_sharing", "true"),
+					resource.TestCheckOutput("planner_allowed", "true"),
+				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue("data.msrest_resource.bare", tfjsonpath.New("output"),
+						knownvalue.ObjectExact(map[string]knownvalue.Check{})),
+				},
 			},
 		},
 	})
 }
 
-func TestObjectResourceThrottledReadAfterWrite(t *testing.T) {
+func TestUpdateResourceThrottledReadAfterWrite(t *testing.T) {
 	api, srv := newMockAPI(t)
 	api.lag = 1
 	// More 429s than the transport retries (3 attempts in tests): the poll after
@@ -394,12 +567,6 @@ func TestObjectResourceThrottledReadAfterWrite(t *testing.T) {
 				Config:    plannerConfig(srv.URL, false),
 				Check: resource.ComposeTestCheckFunc(
 					api.checkValue(plannerPath, "allowCalendarSharing", false),
-					resource.TestCheckResourceAttrWith("msrest_object.planner", "response", func(v string) error {
-						if !strings.Contains(v, `"allowCalendarSharing":false`) {
-							return fmt.Errorf("unexpected response %s", v)
-						}
-						return nil
-					}),
 					func(*terraform.State) error {
 						api.mu.Lock()
 						defer api.mu.Unlock()
@@ -409,6 +576,9 @@ func TestObjectResourceThrottledReadAfterWrite(t *testing.T) {
 						return nil
 					},
 				),
+				ConfigStateChecks: []statecheck.StateCheck{
+					statecheck.ExpectKnownValue(plannerAddr, tfjsonpath.New("output").AtMapKey("sharing"), knownvalue.Bool(false)),
+				},
 			},
 		},
 	})
