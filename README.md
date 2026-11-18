@@ -115,6 +115,11 @@ provider_installation {
 
 The Live test workflow (`.github/workflows/live-test.yml`) builds the provider from each pull request and each push to `main` and runs `test/live` against the toydaria test tenant. It signs in with a federated identity credential (OIDC), so it covers the `use_oidc` path. OpenTofu is pinned in `aqua/aqua.yml`, like GoReleaser. The app it uses (repository secrets `ARM_TENANT_ID`, `ARM_CLIENT_ID`, so the IDs are masked in the run logs) holds only the read roles `OrgSettings-Planner.Read.All` and `Policy.Read.AllowSelfServicePurchase`. The configuration has data sources only and checks that each request returned 2xx with a JSON body. It prints nothing from the responses, and the state is discarded with the runner. Pull requests from forks get no OIDC token and are skipped. The federated credentials use the immutable subject format the repository issues (`repo:terraprovider@177577864/terraform-provider-msrest@1461800443:ref:refs/heads/main` and `...:pull_request`), not `repo:terraprovider/terraform-provider-msrest:...`.
 
+### Dependencies
+
+- **Dependabot** (`.github/dependabot.yml`) opens weekly, grouped PRs for the Go modules (root and `tools/`) and the SHA-pinned GitHub Actions, including the aqua installer in `.github/actions/setup-aqua`.
+- **aqua pins** (`aqua/aqua.yml`: registry, GoReleaser, OpenTofu, Terraform; and the aqua version in `.github/actions/setup-aqua`) are not covered by Dependabot. Start the Update aqua workflow by hand (Actions > Update aqua > Run workflow). It bumps everything to the latest version, refreshes `aqua/aqua-checksums.json` and opens a PR. Because `GITHUB_TOKEN` creates that PR, no checks run on it automatically: close and reopen it to run Test and Live test, and run Build on its branch, before merging.
+
 ### Releases
 
 Pushing a `v*` tag starts the Release workflow (`.github/workflows/release.yml`). It builds the provider with GoReleaser (version pinned in `aqua/aqua.yml`), signs the checksums with the GPG key from the `release` environment (secrets `GPG_PRIVATE_KEY`, `PASSPHRASE`) and creates a draft release. Check its assets, then publish it. The Build workflow runs the same build as a snapshot, without signing, on every push.
