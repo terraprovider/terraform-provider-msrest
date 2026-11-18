@@ -11,30 +11,33 @@ import (
 )
 
 var (
-	_ datasource.DataSource              = &objectDataSource{}
-	_ datasource.DataSourceWithConfigure = &objectDataSource{}
+	_ datasource.DataSource              = &resourceDataSource{}
+	_ datasource.DataSourceWithConfigure = &resourceDataSource{}
 )
 
-// NewObjectDataSource returns the msrest_object data source.
-func NewObjectDataSource() datasource.DataSource { return &objectDataSource{} }
+// NewResourceDataSource returns the msrest_resource data source. Its name and
+// attributes follow the msgraph_resource data source of the msgraph provider.
+func NewResourceDataSource() datasource.DataSource { return &resourceDataSource{} }
 
-type objectDataSource struct{ client *Client }
+type resourceDataSource struct{ client *Client }
 
-type objectDataSourceModel struct {
-	ID       types.String `tfsdk:"id"`
-	URL      types.String `tfsdk:"url"`
-	Scope    types.String `tfsdk:"scope"`
-	Headers  types.Map    `tfsdk:"headers"`
-	Response types.String `tfsdk:"response"`
+type resourceDataSourceModel struct {
+	ID                   types.String  `tfsdk:"id"`
+	URL                  types.String  `tfsdk:"url"`
+	Scope                types.String  `tfsdk:"scope"`
+	Headers              types.Map     `tfsdk:"headers"`
+	ResponseExportValues types.Map     `tfsdk:"response_export_values"`
+	Output               types.Dynamic `tfsdk:"output"`
 }
 
-func (d *objectDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_object"
+func (d *resourceDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_resource"
 }
 
-func (d *objectDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
+func (d *resourceDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Reads a JSON object with `GET`, for example to check settings or to look up IDs.",
+		MarkdownDescription: "Reads a JSON object or collection with `GET`, for example to check settings or to look up IDs. " +
+			"It works like the `msgraph_resource` data source of the msgraph provider, for APIs other than Microsoft Graph.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
@@ -55,15 +58,24 @@ func (d *objectDataSource) Schema(_ context.Context, _ datasource.SchemaRequest,
 				ElementType:         types.StringType,
 				MarkdownDescription: "Additional request headers.",
 			},
-			"response": schema.StringAttribute{
-				Computed:            true,
-				MarkdownDescription: "The JSON response. Use `jsondecode()` to access its values.",
+			"response_export_values": schema.MapAttribute{
+				Optional:    true,
+				ElementType: types.StringType,
+				MarkdownDescription: "Values of the response to export to `output`: the key is the name in `output`, the value a " +
+					"[JMESPath](https://jmespath.org/) query, `@` for the whole response. " +
+					"For example `{ all = \"@\", product_ids = \"items[].productId\" }`.",
+				Validators: []validator.Map{jmesPathQueries()},
+			},
+			"output": schema.DynamicAttribute{
+				Computed: true,
+				MarkdownDescription: "The values selected by `response_export_values`, as an HCL object " +
+					"(for example `data.msrest_resource.x.output.all`). An empty object when `response_export_values` is not set.",
 			},
 		},
 	}
 }
 
-func (d *objectDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
+func (d *resourceDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
 	}
@@ -75,13 +87,15 @@ func (d *objectDataSource) Configure(_ context.Context, req datasource.Configure
 	d.client = c
 }
 
-func (d *objectDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
-	var m objectDataSourceModel
+func (d *resourceDataSource) Read(ctx context.Context, req datasource.ReadRequest, resp *datasource.ReadResponse) {
+	var m resourceDataSourceModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 	headers, diags := stringMap(ctx, m.Headers)
+	resp.Diagnostics.Append(diags...)
+	queries, diags := stringMap(ctx, m.ResponseExportValues)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -96,12 +110,12 @@ func (d *objectDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		resp.Diagnostics.AddError("Object not found", fmt.Sprintf("GET %s returned 404", m.URL.ValueString()))
 		return
 	}
-	s, err := encodeJSON(v)
-	if err != nil {
-		resp.Diagnostics.AddError("Encoding the response failed", err.Error())
+	out, diags := exportValues(ctx, v, queries)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 	m.ID = m.URL
-	m.Response = types.StringValue(s)
+	m.Output = out
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }

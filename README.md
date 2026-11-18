@@ -15,59 +15,65 @@ It authenticates against Entra ID and requests a token for each API's own audien
 | Managed identity | `use_msi = true` |
 | Pre-acquired token | `access_token` (or `MSREST_ACCESS_TOKEN`). It is sent as is, so use one provider alias per token audience. |
 
-## `msrest_object` resource
+## `msrest_update_resource` resource
 
-Manages the properties of an object that is read with `GET` and written with `PATCH`, `PUT` or `POST`. It is meant for settings objects that always exist.
+Manages a subset of the properties of an object that already exists, reading it with `GET` and writing it with `PATCH`, `PUT` or `POST`. It is meant for settings objects that always exist. It works like [`msgraph_update_resource`](https://registry.terraform.io/providers/microsoft/msgraph/latest/docs/resources/update_resource) of the msgraph provider, with the same attribute names, for APIs other than Microsoft Graph.
 
 ```hcl
-resource "msrest_object" "planner" {
+resource "msrest_update_resource" "planner" {
   url     = "https://tasks.office.com/taskAPI/tenantAdminSettings/Settings"
   headers = { "OData-Version" = "4.0;NetFx" }
-  body    = jsonencode({ allowCalendarSharing = false })
+  body    = { allowCalendarSharing = false }
 }
 
-resource "msrest_object" "copilot_self_service_purchase" {
-  url    = "https://licensing.m365.microsoft.com/v1/policies/AllowSelfServicePurchase/products/CFQ7TTC0MM8R"
-  scope  = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
-  method = "PUT"
-  body   = jsonencode({ policyValue = "Disabled" })
+resource "msrest_update_resource" "copilot_self_service_purchase" {
+  url           = "https://licensing.m365.microsoft.com/v1/policies/AllowSelfServicePurchase/products/CFQ7TTC0MM8R"
+  scope         = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
+  update_method = "PUT"
+  body          = { policyValue = "Disabled" }
 }
 ```
 
 | Attribute | |
 | --- | --- |
 | `url` | Required. Where `body` is written, and read from unless `read_url` is set. Changing it replaces the resource. |
-| `body` | Required. JSON with the properties to set, usually from `jsonencode()`. |
-| `method` | `PATCH` (default), `PUT` or `POST`. |
+| `body` | Required. The properties to set, as an HCL object; it is sent as JSON. Not a string: write `body = { ... }`, not `body = jsonencode({ ... })`. For a JSON document from a file, use `jsondecode()`. |
+| `update_method` | `PATCH` (default), `PUT` or `POST`. |
 | `scope` | Token scope, for example `https://tasks.office.com/.default` or `<application id>/.default`. Defaults to `https://<host of the URL>/.default`, which only works if that host is an App ID URI of the API (true for Planner, not for licensing). |
 | `headers` | Extra request headers. |
 | `read_url` | Read from a different URL. |
-| `delete_method`, `delete_body` | Request sent on destroy, for example to restore a default. Without them, destroy only removes the resource from the state. |
+| `delete_method`, `delete_body` | Request sent on destroy, for example to restore a default. Without `delete_body` the request has no body. Without `delete_method`, destroy only removes the resource from the state. |
 | `read_after_write_timeout` | Seconds to keep reading after a write until the API returns the written values (default `120`, `0` = read once). |
-| `response` | Computed. The full JSON of the last read. |
+| `response_export_values` | Values of the response to put into `output`: name = [JMESPath](https://jmespath.org/) query, `@` for the whole response, for example `{ all = "@", name = "productName" }`. |
+| `output` | Computed. The values selected by `response_export_values` from the last read, as an HCL object (`msrest_update_resource.x.output.name`). An empty object when `response_export_values` is not set. |
 
 How it behaves:
 
 - **Only the properties in `body` are managed.** Each refresh reads the object and compares just those properties, by value: key order and number formatting are ignored, and keys match case-insensitively. A change made outside of Terraform shows up as a diff on `body`, and the next apply writes the value again. Other properties of the object are ignored.
 - **A property the API does not return** is treated as write-only and never shows drift. After a write, the provider warns about such properties, so a misspelled name gets noticed.
 - **Eventual consistency.** After a write, the provider keeps reading until the API returns the written values, so the next plan does not show stale drift. Planner, for example, takes about 30 s. If the values do not show up within `read_after_write_timeout`, the apply still succeeds with a warning.
-- **Import.** `tofu import msrest_object.planner https://tasks.office.com/taskAPI/tenantAdminSettings/Settings`. The first plan after the import writes `body` once.
+- **Import.** `tofu import msrest_update_resource.planner https://tasks.office.com/taskAPI/tenantAdminSettings/Settings`. The first plan after the import writes `body` once.
 - Throttling (429, honouring `Retry-After`) and transient 5xx errors are retried with backoff (up to 8 attempts). The Planner Tasks API throttles after a few reads within seconds.
 - A 404 on read removes the resource from the state.
+- Numbers are sent as written: integers without exponent (`2000000`, not `2e+06`).
 
-## `msrest_object` data source
+## `msrest_resource` data source
 
-Reads a URL with `GET` and returns the JSON in `response`. Use it to check settings with a read-only identity.
+Reads a URL with `GET` and exports values of the response to `output`, like the [`msgraph_resource`](https://registry.terraform.io/providers/microsoft/msgraph/latest/docs/data-sources/resource) data source. Use it to check settings with a read-only identity or to look up IDs.
 
 ```hcl
-data "msrest_object" "planner" {
+data "msrest_resource" "planner" {
   url = "https://tasks.office.com/taskAPI/tenantAdminSettings/Settings"
+
+  response_export_values = { sharing = "allowCalendarSharing" }
 }
 
 output "planner_calendar_sharing" {
-  value = jsondecode(data.msrest_object.planner.response).allowCalendarSharing
+  value = data.msrest_resource.planner.output.sharing
 }
 ```
+
+Attributes: `url` (required), `scope`, `headers`, `response_export_values` and `output`, as for the resource. A 404 is an error.
 
 ## Known APIs
 
@@ -99,6 +105,10 @@ provider_installation {
   direct {}
 }
 ```
+
+### Releases
+
+Pushing a `v*` tag starts the Release workflow (`.github/workflows/release.yml`). It builds the provider with GoReleaser (version pinned in `aqua/aqua.yml`), signs the checksums with the GPG key from the `release` environment (secrets `GPG_PRIVATE_KEY`, `PASSPHRASE`) and creates a draft release. Check its assets, then publish it. The Build workflow runs the same build as a snapshot, without signing, on every push.
 
 ## License
 

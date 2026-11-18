@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/dynamicvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -26,7 +27,7 @@ import (
 )
 
 const (
-	defaultMethod                = http.MethodPatch
+	defaultUpdateMethod          = http.MethodPatch
 	defaultReadAfterWriteTimeout = 120 // seconds
 )
 
@@ -35,38 +36,41 @@ const (
 var pollInterval = 5 * time.Second
 
 var (
-	_ resource.Resource                = &objectResource{}
-	_ resource.ResourceWithConfigure   = &objectResource{}
-	_ resource.ResourceWithImportState = &objectResource{}
+	_ resource.Resource                = &updateResource{}
+	_ resource.ResourceWithConfigure   = &updateResource{}
+	_ resource.ResourceWithImportState = &updateResource{}
 )
 
-// NewObjectResource returns the msrest_object resource.
-func NewObjectResource() resource.Resource { return &objectResource{} }
+// NewUpdateResource returns the msrest_update_resource resource. Its name and
+// attributes follow msgraph_update_resource of the msgraph provider.
+func NewUpdateResource() resource.Resource { return &updateResource{} }
 
-type objectResource struct{ client *Client }
+type updateResource struct{ client *Client }
 
-type objectModel struct {
-	ID                    types.String `tfsdk:"id"`
-	URL                   types.String `tfsdk:"url"`
-	ReadURL               types.String `tfsdk:"read_url"`
-	Scope                 types.String `tfsdk:"scope"`
-	Method                types.String `tfsdk:"method"`
-	Headers               types.Map    `tfsdk:"headers"`
-	Body                  types.String `tfsdk:"body"`
-	DeleteMethod          types.String `tfsdk:"delete_method"`
-	DeleteBody            types.String `tfsdk:"delete_body"`
-	ReadAfterWriteTimeout types.Int64  `tfsdk:"read_after_write_timeout"`
-	Response              types.String `tfsdk:"response"`
+type updateResourceModel struct {
+	ID                    types.String  `tfsdk:"id"`
+	URL                   types.String  `tfsdk:"url"`
+	ReadURL               types.String  `tfsdk:"read_url"`
+	Scope                 types.String  `tfsdk:"scope"`
+	UpdateMethod          types.String  `tfsdk:"update_method"`
+	Headers               types.Map     `tfsdk:"headers"`
+	Body                  types.Dynamic `tfsdk:"body"`
+	DeleteMethod          types.String  `tfsdk:"delete_method"`
+	DeleteBody            types.Dynamic `tfsdk:"delete_body"`
+	ReadAfterWriteTimeout types.Int64   `tfsdk:"read_after_write_timeout"`
+	ResponseExportValues  types.Map     `tfsdk:"response_export_values"`
+	Output                types.Dynamic `tfsdk:"output"`
 }
 
-func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_object"
+func (r *updateResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_update_resource"
 }
 
-func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+func (r *updateResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Manages the properties of an object behind a REST API that is read with `GET` " +
-			"and written with `PATCH`, `PUT` or `POST`, typically a settings object that always exists.\n\n" +
+		MarkdownDescription: "Manages a subset of the properties of an existing object behind a REST API that is read with `GET` " +
+			"and written with `PATCH`, `PUT` or `POST`, typically a settings object that always exists. " +
+			"It works like `msgraph_update_resource` of the msgraph provider, for APIs other than Microsoft Graph.\n\n" +
 			"Only the properties in `body` are managed. On every refresh the provider reads the object and " +
 			"compares just those properties, so a change made outside of Terraform shows up as a diff on `body`. " +
 			"Destroying the resource only removes it from the state, unless `delete_method` is set.",
@@ -92,10 +96,10 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				MarkdownDescription: "OAuth scope (or resource) of the token, for example `https://tasks.office.com/.default` " +
 					"or `aeb86249-8ea3-49e2-900b-54cc8e308f85/.default`. Defaults to `https://<host of the request URL>/.default`.",
 			},
-			"method": schema.StringAttribute{
+			"update_method": schema.StringAttribute{
 				Optional:            true,
 				Computed:            true,
-				Default:             stringdefault.StaticString(defaultMethod),
+				Default:             stringdefault.StaticString(defaultUpdateMethod),
 				MarkdownDescription: "HTTP method that writes `body` on create and update: `PATCH` (default), `PUT` or `POST`.",
 				Validators:          []validator.String{stringvalidator.OneOf(http.MethodPatch, http.MethodPut, http.MethodPost)},
 			},
@@ -104,11 +108,12 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				ElementType:         types.StringType,
 				MarkdownDescription: "Additional request headers, sent with every request (for example `OData-Version`).",
 			},
-			"body": schema.StringAttribute{
+			"body": schema.DynamicAttribute{
 				Required: true,
-				MarkdownDescription: "JSON document with the properties to set, usually built with `jsonencode()`. " +
-					"Only these properties are compared on refresh. A property the API does not return is treated as write-only and never shows drift.",
-				Validators: []validator.String{validJSON()},
+				MarkdownDescription: "The properties to set, as an HCL object such as `{ allowCalendarSharing = false }`. " +
+					"It is sent as JSON. Only these properties are compared on refresh. " +
+					"A property the API does not return is treated as write-only and never shows drift.",
+				Validators: []validator.Dynamic{requestBody()},
 			},
 			"delete_method": schema.StringAttribute{
 				Optional: true,
@@ -116,12 +121,13 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"When unset, destroying only removes the resource from the state and leaves the object as it is.",
 				Validators: []validator.String{stringvalidator.OneOf(http.MethodDelete, http.MethodPatch, http.MethodPut, http.MethodPost)},
 			},
-			"delete_body": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "JSON document sent with `delete_method`, for example to restore defaults.",
-				Validators: []validator.String{
-					validJSON(),
-					stringvalidator.AlsoRequires(path.MatchRoot("delete_method")),
+			"delete_body": schema.DynamicAttribute{
+				Optional: true,
+				MarkdownDescription: "HCL object sent as JSON with `delete_method`, for example to restore defaults. " +
+					"Without it, the destroy request has no body.",
+				Validators: []validator.Dynamic{
+					requestBody(),
+					dynamicvalidator.AlsoRequires(path.MatchRoot("delete_method")),
 				},
 			},
 			"read_after_write_timeout": schema.Int64Attribute{
@@ -133,15 +139,24 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"If the values do not show up in time, the apply still succeeds with a warning.", defaultReadAfterWriteTimeout),
 				Validators: []validator.Int64{int64validator.AtLeast(0)},
 			},
-			"response": schema.StringAttribute{
-				Computed:            true,
-				MarkdownDescription: "The complete JSON response of the last read. Use `jsondecode()` to access its values.",
+			"response_export_values": schema.MapAttribute{
+				Optional:    true,
+				ElementType: types.StringType,
+				MarkdownDescription: "Values of the response to export to `output`: the key is the name in `output`, the value a " +
+					"[JMESPath](https://jmespath.org/) query, `@` for the whole response. " +
+					"For example `{ all = \"@\", sharing = \"allowCalendarSharing\" }`.",
+				Validators: []validator.Map{jmesPathQueries()},
+			},
+			"output": schema.DynamicAttribute{
+				Computed: true,
+				MarkdownDescription: "The values selected by `response_export_values` from the last read, as an HCL object " +
+					"(for example `msrest_update_resource.x.output.all`). An empty object when `response_export_values` is not set.",
 			},
 		},
 	}
 }
 
-func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+func (r *updateResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
 	}
@@ -153,8 +168,8 @@ func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = c
 }
 
-func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	var m objectModel
+func (r *updateResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
+	var m updateResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -166,8 +181,8 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var m objectModel
+func (r *updateResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var m updateResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -180,15 +195,22 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 }
 
 // write sends body, then reads the object back until it reflects body (or the
-// timeout passes) and stores the last response. body itself stays as planned,
-// so a slow API cannot make the apply inconsistent.
-func (r *objectResource) write(ctx context.Context, m *objectModel, diags *diag.Diagnostics) {
-	desired, err := decodeJSON([]byte(m.Body.ValueString()))
+// timeout passes) and exports values of the last response. body itself stays as
+// planned, so a slow API cannot make the apply inconsistent.
+func (r *updateResource) write(ctx context.Context, m *updateResourceModel, diags *diag.Diagnostics) {
+	desired, err := toJSON(ctx, m.Body)
 	if err != nil {
-		diags.AddAttributeError(path.Root("body"), "Invalid JSON", err.Error())
+		diags.AddAttributeError(path.Root("body"), "Invalid body", err.Error())
+		return
+	}
+	payload, err := encodeJSON(desired)
+	if err != nil {
+		diags.AddAttributeError(path.Root("body"), "Encoding the body failed", err.Error())
 		return
 	}
 	headers, d := stringMap(ctx, m.Headers)
+	diags.Append(d...)
+	queries, d := stringMap(ctx, m.ResponseExportValues)
 	diags.Append(d...)
 	if diags.HasError() {
 		return
@@ -200,11 +222,11 @@ func (r *objectResource) write(ctx context.Context, m *objectModel, diags *diag.
 	}
 
 	_, err = r.client.Do(ctx, Request{
-		Method:   m.Method.ValueString(),
+		Method:   m.UpdateMethod.ValueString(),
 		URL:      m.URL.ValueString(),
 		Resource: resource,
 		Headers:  headers,
-		Body:     []byte(m.Body.ValueString()),
+		Body:     []byte(payload),
 	})
 	if err != nil {
 		diags.AddError("Writing the object failed", err.Error())
@@ -251,7 +273,7 @@ func (r *objectResource) write(ctx context.Context, m *objectModel, diags *diag.
 				"the next plan shows a diff on body until the change has propagated or if the API ignored a value.",
 				timeout, m.readURL()))
 	}
-	m.Response = types.StringNull()
+	m.Output = types.DynamicNull()
 	if seen {
 		if missing := missingPaths(desired, last); len(missing) > 0 {
 			diags.AddAttributeWarning(path.Root("body"), "Properties not returned by the API",
@@ -259,22 +281,21 @@ func (r *objectResource) write(ctx context.Context, m *objectModel, diags *diag.
 					"If that is not expected, check the property names: the API may have ignored them.",
 					m.readURL(), strings.Join(missing, ", ")))
 		}
-		s, err := encodeJSON(last)
-		if err != nil {
-			diags.AddError("Encoding the response failed", err.Error())
-			return
-		}
-		m.Response = types.StringValue(s)
+		out, d := exportValues(ctx, last, queries)
+		diags.Append(d...)
+		m.Output = out
 	}
 }
 
-func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	var m objectModel
+func (r *updateResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
+	var m updateResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 	headers, d := stringMap(ctx, m.Headers)
+	resp.Diagnostics.Append(d...)
+	queries, d := stringMap(ctx, m.ResponseExportValues)
 	resp.Diagnostics.Append(d...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -291,43 +312,44 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	// body: keep the stored text while the API matches it (so formatting never
-	// causes a diff), otherwise store the values the API returns.
-	if m.Body.IsNull() || m.Body.ValueString() == "" {
+	// body: keep the stored value while the API matches it, so that neither
+	// number formatting nor the HCL types of the configuration (a tuple here, a
+	// list there) cause a diff. Otherwise store the values the API returns.
+	if m.Body.IsNull() || m.Body.IsUnderlyingValueNull() {
 		// After an import there is no configured body yet: take the full response.
-		s, err := encodeJSON(actual)
+		b, err := fromJSONDynamic(ctx, actual)
 		if err != nil {
-			resp.Diagnostics.AddError("Encoding the response failed", err.Error())
+			resp.Diagnostics.AddError("Converting the response failed", err.Error())
 			return
 		}
-		m.Body = types.StringValue(s)
+		m.Body = b
 	} else {
-		desired, err := decodeJSON([]byte(m.Body.ValueString()))
+		desired, err := toJSON(ctx, m.Body)
 		if err != nil {
-			resp.Diagnostics.AddAttributeError(path.Root("body"), "Invalid JSON in state", err.Error())
+			resp.Diagnostics.AddAttributeError(path.Root("body"), "Invalid body in state", err.Error())
 			return
 		}
 		if projected := project(desired, actual); !jsonEqual(projected, desired) {
-			s, err := encodeJSON(projected)
+			b, err := fromJSONDynamic(ctx, projected)
 			if err != nil {
-				resp.Diagnostics.AddError("Encoding the response failed", err.Error())
+				resp.Diagnostics.AddError("Converting the response failed", err.Error())
 				return
 			}
-			m.Body = types.StringValue(s)
+			m.Body = b
 		}
 	}
 
-	s, err := encodeJSON(actual)
-	if err != nil {
-		resp.Diagnostics.AddError("Encoding the response failed", err.Error())
+	out, d := exportValues(ctx, actual, queries)
+	resp.Diagnostics.Append(d...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
-	m.Response = types.StringValue(s)
+	m.Output = out
 
 	// Defaults for an imported object.
 	m.ID = m.URL
-	if m.Method.IsNull() {
-		m.Method = types.StringValue(defaultMethod)
+	if m.UpdateMethod.IsNull() {
+		m.UpdateMethod = types.StringValue(defaultUpdateMethod)
 	}
 	if m.ReadAfterWriteTimeout.IsNull() {
 		m.ReadAfterWriteTimeout = types.Int64Value(defaultReadAfterWriteTimeout)
@@ -336,8 +358,8 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
-func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
-	var m objectModel
+func (r *updateResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
+	var m updateResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -356,9 +378,20 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		resp.Diagnostics.AddAttributeError(path.Root("scope"), "Cannot determine the token scope", err.Error())
 		return
 	}
+	// No delete_body means a request without a body (not "null" or "{}").
 	var body []byte
-	if !m.DeleteBody.IsNull() {
-		body = []byte(m.DeleteBody.ValueString())
+	if !m.DeleteBody.IsNull() && !m.DeleteBody.IsUnderlyingValueNull() {
+		v, err := toJSON(ctx, m.DeleteBody)
+		if err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("delete_body"), "Invalid delete_body", err.Error())
+			return
+		}
+		s, err := encodeJSON(v)
+		if err != nil {
+			resp.Diagnostics.AddAttributeError(path.Root("delete_body"), "Encoding delete_body failed", err.Error())
+			return
+		}
+		body = []byte(s)
 	}
 	_, err = r.client.Do(ctx, Request{
 		Method:   m.DeleteMethod.ValueString(),
@@ -373,17 +406,17 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 }
 
 // ImportState takes the object URL as the import ID.
-func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
+func (r *updateResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("url"), req.ID)...)
 }
 
 // get reads the object. found is false on HTTP 404.
-func (r *objectResource) get(ctx context.Context, m *objectModel, headers map[string]string) (any, bool, error) {
+func (r *updateResource) get(ctx context.Context, m *updateResourceModel, headers map[string]string) (any, bool, error) {
 	return getJSON(ctx, r.client, m.readURL(), m.Scope.ValueString(), headers)
 }
 
-func (m *objectModel) readURL() string {
+func (m *updateResourceModel) readURL() string {
 	if !m.ReadURL.IsNull() && m.ReadURL.ValueString() != "" {
 		return m.ReadURL.ValueString()
 	}

@@ -1,12 +1,12 @@
 # Planner tenant settings (singleton). Needs the app role
 # OrgSettings-Planner.ReadWrite.All on ProjectWorkManagement. The token scope
 # defaults to https://tasks.office.com/.default (the host of url).
-resource "msrest_object" "planner" {
+resource "msrest_update_resource" "planner" {
   url     = "https://tasks.office.com/taskAPI/tenantAdminSettings/Settings"
   headers = { "OData-Version" = "4.0;NetFx" }
-  body = jsonencode({
+  body = {
     allowCalendarSharing = false
-  })
+  }
 }
 
 # Self-service purchase policy, one object per product. Needs the app role
@@ -19,19 +19,21 @@ locals {
   }
 }
 
-resource "msrest_object" "self_service_purchase" {
+resource "msrest_update_resource" "self_service_purchase" {
   for_each = local.self_service_purchase
 
-  url    = "https://licensing.m365.microsoft.com/v1/policies/AllowSelfServicePurchase/products/${each.key}"
-  scope  = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
-  method = "PUT"
-  body   = jsonencode({ policyValue = each.value })
+  url           = "https://licensing.m365.microsoft.com/v1/policies/AllowSelfServicePurchase/products/${each.key}"
+  scope         = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
+  update_method = "PUT"
+  body          = { policyValue = each.value }
 
   # Optional: restore the default when the resource is destroyed.
   delete_method = "PUT"
-  delete_body   = jsonencode({ policyValue = "Enabled" })
+  delete_body   = { policyValue = "Enabled" }
+
+  response_export_values = { product_name = "productName" }
 }
 
 output "copilot_product_name" {
-  value = jsondecode(msrest_object.self_service_purchase["CFQ7TTC0MM8R"].response).productName
+  value = msrest_update_resource.self_service_purchase["CFQ7TTC0MM8R"].output.product_name
 }

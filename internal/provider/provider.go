@@ -83,11 +83,11 @@ func (p *msrestProvider) Configure(ctx context.Context, req provider.ConfigureRe
 }
 
 func (p *msrestProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewObjectResource}
+	return []func() resource.Resource{NewUpdateResource}
 }
 
 func (p *msrestProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{NewObjectDataSource}
+	return []func() datasource.DataSource{NewResourceDataSource}
 }
 
 func firstNonEmpty(values ...string) string {
