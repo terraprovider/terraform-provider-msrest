@@ -60,6 +60,7 @@ type updateResourceModel struct {
 	ReadAfterWriteTimeout types.Int64   `tfsdk:"read_after_write_timeout"`
 	ResponseExportValues  types.Map     `tfsdk:"response_export_values"`
 	Output                types.Dynamic `tfsdk:"output"`
+	Concurrency           types.String  `tfsdk:"concurrency"`
 }
 
 func (r *updateResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -147,6 +148,18 @@ func (r *updateResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 					"For example `{ all = \"@\", sharing = \"allowCalendarSharing\" }`.",
 				Validators: []validator.Map{jmesPathQueries()},
 			},
+			"concurrency": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Name of a concurrency group: resources in the same group write one at a time, " +
+					"for APIs that reject parallel writes (the self-service purchase policies of the licensing API answer them " +
+					"with HTTP 412). The group covers the write request (including its retries) and the request of `delete_method`. " +
+					"Reads are not serialized: while one resource waits for its values to show up (`read_after_write_timeout`), " +
+					"the next one in the group already writes. " +
+					"The group holds within one provider process, that is, one provider configuration of one run; " +
+					"for writes from elsewhere, a 412 without a client precondition (`If-Match`, `If-None-Match`, " +
+					"`If-Unmodified-Since`) is retried. Changing it writes nothing.",
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
+			},
 			"output": schema.DynamicAttribute{
 				Computed: true,
 				MarkdownDescription: "The values selected by `response_export_values` from the last read, as an HCL object " +
@@ -183,9 +196,16 @@ func (r *updateResource) Create(ctx context.Context, req resource.CreateRequest,
 }
 
 func (r *updateResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var m updateResourceModel
+	var m, state updateResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &m)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	if onlyConcurrencyChanged(m, state) {
+		// concurrency is not part of the object: store it without a write.
+		m.ID, m.Output = state.ID, state.Output
+		resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 		return
 	}
 	r.write(ctx, &m, &resp.Diagnostics)
@@ -222,6 +242,14 @@ func (r *updateResource) write(ctx context.Context, m *updateResourceModel, diag
 		return
 	}
 
+	release, err := writeGroups.acquire(ctx, m.Concurrency.ValueString())
+	if err != nil {
+		diags.AddError("Waiting for the concurrency group failed", err.Error())
+		return
+	}
+	// The group covers the request and its retries, not the reads after it:
+	// those cannot collide, and the next write can go out while this one
+	// propagates.
 	_, err = r.client.Do(ctx, Request{
 		Method:   m.UpdateMethod.ValueString(),
 		URL:      m.URL.ValueString(),
@@ -229,6 +257,7 @@ func (r *updateResource) write(ctx context.Context, m *updateResourceModel, diag
 		Headers:  headers,
 		Body:     []byte(payload),
 	})
+	release()
 	if err != nil {
 		diags.AddError("Writing the object failed", err.Error())
 		return
@@ -399,6 +428,12 @@ func (r *updateResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		}
 		body = []byte(s)
 	}
+	release, err := writeGroups.acquire(ctx, m.Concurrency.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Waiting for the concurrency group failed", err.Error())
+		return
+	}
+	defer release()
 	_, err = r.client.Do(ctx, Request{
 		Method:   m.DeleteMethod.ValueString(),
 		URL:      m.URL.ValueString(),
@@ -409,6 +444,23 @@ func (r *updateResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	if err != nil && !httpx.IsNotFound(err) {
 		resp.Diagnostics.AddError("Deleting the object failed", err.Error())
 	}
+}
+
+// onlyConcurrencyChanged reports whether plan differs from state in nothing
+// that is sent to the API, apart from concurrency. output is left out: it is
+// unknown in the plan when response_export_values is set.
+func onlyConcurrencyChanged(plan, state updateResourceModel) bool {
+	return !plan.Concurrency.Equal(state.Concurrency) &&
+		plan.URL.Equal(state.URL) &&
+		plan.ReadURL.Equal(state.ReadURL) &&
+		plan.Scope.Equal(state.Scope) &&
+		plan.UpdateMethod.Equal(state.UpdateMethod) &&
+		plan.Headers.Equal(state.Headers) &&
+		plan.Body.Equal(state.Body) &&
+		plan.DeleteMethod.Equal(state.DeleteMethod) &&
+		plan.DeleteBody.Equal(state.DeleteBody) &&
+		plan.ReadAfterWriteTimeout.Equal(state.ReadAfterWriteTimeout) &&
+		plan.ResponseExportValues.Equal(state.ResponseExportValues)
 }
 
 // ImportState takes the object URL as the import ID.

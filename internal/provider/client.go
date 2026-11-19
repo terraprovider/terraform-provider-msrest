@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,7 +32,14 @@ type Client struct {
 // responses. The admin APIs throttle aggressively (the Planner Tasks API
 // answers 429 after a few reads within seconds), so it is more patient than the
 // go-msadmin default. A variable so tests can shorten it.
-var retryConfig = retry.Config{MaxAttempts: 8, BaseDelay: 2 * time.Second, MaxDelay: 60 * time.Second}
+var retryConfig = retry.Config{MaxAttempts: 8, BaseDelay: 2 * time.Second, MaxDelay: 60 * time.Second, Jitter: 0.2}
+
+// conflictRetryConfig bounds the retries of 412 Precondition Failed on requests
+// without a client precondition (see preconditionTransport). Each wait is drawn
+// uniformly from [0, min(MaxDelay, BaseDelay*2^(attempt-1))] ("full jitter"), so
+// requests that collided spread out instead of colliding again. A variable so
+// tests can shorten it.
+var conflictRetryConfig = retry.Config{MaxAttempts: 10, BaseDelay: 1 * time.Second, MaxDelay: 30 * time.Second}
 
 // NewClient returns a Client that retries throttling and transient errors and
 // logs the full traffic (credentials redacted) at TF_LOG=DEBUG.
@@ -39,11 +47,88 @@ func NewClient(tokens auth.TokenProvider, userAgent string) *Client {
 	return &Client{
 		Tokens: tokens,
 		HTTP: &http.Client{
-			Transport: retry.NewTransport(httpx.NewDebugTransport(nil), retryConfig),
-			Timeout:   10 * time.Minute,
+			Transport: &preconditionTransport{
+				Base:   retry.NewTransport(httpx.NewDebugTransport(nil), retryConfig),
+				Config: conflictRetryConfig,
+			},
+			Timeout: 10 * time.Minute,
 		},
 		UserAgent: userAgent,
 	}
+}
+
+// preconditionHeaders are the request headers that make a 412 the answer to
+// the client's own condition.
+var preconditionHeaders = []string{"If-Match", "If-None-Match", "If-Unmodified-Since"}
+
+// preconditionTransport retries 412 Precondition Failed when the request
+// carried no precondition. Such a 412 comes from the service's own optimistic
+// concurrency: the licensing API keeps the self-service purchase policies of a
+// tenant in one Cosmos DB document, so parallel PUTs to different products
+// collide and all but one fail without writing anything (#14). Repeating the
+// request is then safe. With a client precondition, 412 means the object has
+// changed and is returned as is.
+type preconditionTransport struct {
+	Base   http.RoundTripper
+	Config retry.Config
+}
+
+// RoundTrip implements http.RoundTripper.
+func (t *preconditionTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if hasPrecondition(req.Header) {
+		return t.Base.RoundTrip(req)
+	}
+	cfg := t.Config
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = retry.DefaultMaxAttempts
+	}
+	if cfg.BaseDelay <= 0 {
+		cfg.BaseDelay = retry.DefaultBaseDelay
+	}
+	if cfg.MaxDelay <= 0 {
+		cfg.MaxDelay = retry.DefaultMaxDelay
+	}
+	for attempt := 1; ; attempt++ {
+		if attempt > 1 && req.Body != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			req.Body = body
+		}
+		resp, err := t.Base.RoundTrip(req)
+		if err != nil || resp.StatusCode != http.StatusPreconditionFailed || attempt >= cfg.MaxAttempts ||
+			(req.Body != nil && req.GetBody == nil) { // the body cannot be replayed
+			return resp, err
+		}
+		// Drain and close the body so the connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		_ = resp.Body.Close()
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(fullJitter(cfg, attempt)):
+		}
+	}
+}
+
+func hasPrecondition(h http.Header) bool {
+	for _, k := range preconditionHeaders {
+		if h.Get(k) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// fullJitter returns a random wait in [0, min(MaxDelay, BaseDelay*2^(attempt-1))].
+func fullJitter(cfg retry.Config, attempt int) time.Duration {
+	d := cfg.BaseDelay
+	for i := 1; i < attempt && d < cfg.MaxDelay; i++ {
+		d *= 2
+	}
+	d = min(d, cfg.MaxDelay)
+	return time.Duration(rand.Int64N(int64(d) + 1))
 }
 
 // Request is one API call.

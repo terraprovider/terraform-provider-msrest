@@ -45,6 +45,7 @@ resource "msrest_update_resource" "copilot_self_service_purchase" {
 | `delete_method`, `delete_body` | Request sent on destroy, for example to restore a default. Without `delete_body` the request has no body. Without `delete_method`, destroy only removes the resource from the state. |
 | `read_after_write_timeout` | Seconds to keep reading after a write until the API returns the written values (default `120`, `0` = read once). |
 | `response_export_values` | Values of the response to put into `output`: name = [JMESPath](https://jmespath.org/) query, `@` for the whole response, for example `{ all = "@", name = "productName" }`. |
+| `concurrency` | Name of a concurrency group: resources in the same group write one at a time, for APIs that reject parallel writes, for example `"m365-licensing"`. Changing it writes nothing. |
 | `output` | Computed. The values selected by `response_export_values` from the last read, as an HCL object (`msrest_update_resource.x.output.name`). An empty object when `response_export_values` is not set. |
 
 How it behaves:
@@ -54,6 +55,7 @@ How it behaves:
 - **Eventual consistency.** After a write, the provider keeps reading until the API returns the written values, so the next plan does not show stale drift. Planner, for example, takes about 30 s. If the values do not show up within `read_after_write_timeout`, the apply still succeeds with a warning.
 - **Import.** `tofu import msrest_update_resource.planner https://tasks.office.com/taskAPI/tenantAdminSettings/Settings`. The first plan after the import writes `body` once.
 - Throttling (429, honouring `Retry-After`) and transient 5xx errors are retried with backoff (up to 8 attempts). The Planner Tasks API throttles after a few reads within seconds.
+- **Parallel writes.** The licensing API keeps the self-service purchase policies of a tenant in one document and answers parallel writes with 412 Precondition Failed, without writing anything. Put such resources into one `concurrency` group: their write requests (including retries, and the `delete_method` request) then run one at a time. The reads after a write are not serialized, so the next resource writes while the previous one propagates. The group holds within one provider process, that is, one provider configuration of one run. For writes from elsewhere, a 412 is retried with randomised backoff (up to 10 attempts) when the request carried no precondition of its own (`If-Match`, `If-None-Match`, `If-Unmodified-Since`); with one, the 412 is returned as an error.
 - A 404 on read removes the resource from the state.
 - Numbers are sent as written: integers without exponent (`2000000`, not `2e+06`).
 

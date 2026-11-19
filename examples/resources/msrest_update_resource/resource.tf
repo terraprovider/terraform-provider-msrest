@@ -27,6 +27,10 @@ resource "msrest_update_resource" "self_service_purchase" {
   update_method = "PUT"
   body          = { policyValue = each.value }
 
+  # The licensing API answers parallel writes with HTTP 412, so write the
+  # products one at a time.
+  concurrency = "m365-licensing"
+
   # Optional: restore the default when the resource is destroyed.
   delete_method = "PUT"
   delete_body   = { policyValue = "Enabled" }
