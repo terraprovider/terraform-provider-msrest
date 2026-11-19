@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -691,24 +690,42 @@ resource "msrest_update_resource" "purchase" {
 	})
 }
 
-// writeTracker sits in front of the mock API, records the order of all requests
-// and how many writes (any method but GET) are in flight at once. Each write is held for a moment so
+// writeTracker sits in front of the mock API and records how many writes (any
+// method but GET) are in flight at once. Each write is held for a moment so
 // that writes that are not serialized overlap. With barrier > 0, writes are
-// instead held until `barrier` writes were in flight at once (or 5 s passed).
+// instead held until `barrier` writes were in flight at once. With
+// getsAfterWrites > 0, every GET is held until that many writes have arrived.
+// Each hold ends after 5 s at the latest, and getTimedOut records it for GETs.
 type writeTracker struct {
-	next    http.Handler
-	barrier int
+	next            http.Handler
+	barrier         int
+	getsAfterWrites int
 
 	mu                       sync.Mutex
 	active, maxActive, count int
-	events                   []string // "METHOD path" in the order received
+	getTimedOut              bool
+}
+
+// waitFor polls cond for up to 5 s and reports whether it became true.
+func (w *writeTracker) waitFor(cond func() bool) bool {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		w.mu.Lock()
+		ok := cond()
+		w.mu.Unlock()
+		if ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *writeTracker) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
-	w.mu.Lock()
-	w.events = append(w.events, r.Method+" "+r.URL.Path)
-	w.mu.Unlock()
 	if r.Method == http.MethodGet {
+		if w.getsAfterWrites > 0 && !w.waitFor(func() bool { return w.count >= w.getsAfterWrites }) {
+			w.mu.Lock()
+			w.getTimedOut = true
+			w.mu.Unlock()
+		}
 		w.next.ServeHTTP(rw, r)
 		return
 	}
@@ -718,14 +735,7 @@ func (w *writeTracker) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	w.maxActive = max(w.maxActive, w.active)
 	w.mu.Unlock()
 	if w.barrier > 0 {
-		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
-			w.mu.Lock()
-			reached := w.maxActive >= w.barrier
-			w.mu.Unlock()
-			if reached {
-				break
-			}
-		}
+		w.waitFor(func() bool { return w.maxActive >= w.barrier })
 	} else {
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -742,30 +752,8 @@ func (w *writeTracker) check(wantMax, wantCount int) resource.TestCheckFunc {
 		if w.maxActive != wantMax || w.count != wantCount {
 			return fmt.Errorf("%d writes, at most %d at once; want %d writes, at most %d at once", w.count, w.maxActive, wantCount, wantMax)
 		}
-		return nil
-	}
-}
-
-// checkPollsInGroup checks that each PUT is directly followed by its own
-// read-after-write GETs (polls of them), that is, no other request of the
-// group came in between: the group stays held while the write is polled.
-func (w *writeTracker) checkPollsInGroup(polls int) resource.TestCheckFunc {
-	return func(*terraform.State) error {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		for i, e := range w.events {
-			path, isPut := strings.CutPrefix(e, http.MethodPut+" ")
-			if !isPut {
-				continue
-			}
-			if i+polls >= len(w.events) {
-				return fmt.Errorf("%s: only %d requests followed, want %d GETs", e, len(w.events)-i-1, polls)
-			}
-			for _, next := range w.events[i+1 : i+1+polls] {
-				if next != http.MethodGet+" "+path {
-					return fmt.Errorf("%s was followed by %q before its %d read-after-write GETs: %v", e, next, polls, w.events)
-				}
-			}
+		if w.getTimedOut {
+			return fmt.Errorf("a GET waited 5 s for %d writes: a read after a write held the concurrency group", w.getsAfterWrites)
 		}
 		return nil
 	}
@@ -783,13 +771,13 @@ func newTrackedMockAPI(t *testing.T, products, barrier int) (*mockAPI, *writeTra
 }
 
 // Resources in the same concurrency group write one at a time, on create and
-// on destroy with delete_method. The group is held until the read after the
-// write shows the value: with lag 2, each PUT is followed by three GETs of the
-// same object before the next PUT.
+// on destroy with delete_method. The reads after a write do not hold the group:
+// every GET is held until all n PUTs have arrived, which only happens if the
+// next resource can write while the previous one polls.
 func TestUpdateResourceConcurrencySerializesWrites(t *testing.T) {
 	const n = 6
 	api, tracker, srv := newTrackedMockAPI(t, n, 0)
-	api.lag = 2
+	tracker.getsAfterWrites = n
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testProviderFactories,
 		CheckDestroy: resource.ComposeTestCheckFunc(
@@ -811,7 +799,6 @@ resource "msrest_update_resource" "purchase" {
 `, n, srv.URL, purchaseBase),
 				Check: resource.ComposeTestCheckFunc(
 					tracker.check(1, n),
-					tracker.checkPollsInGroup(api.lag+1),
 					api.checkValue(purchaseBase+fmt.Sprintf("P%d", n), "policyValue", "Disabled"),
 				),
 			},

@@ -152,8 +152,9 @@ func (r *updateResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional: true,
 				MarkdownDescription: "Name of a concurrency group: resources in the same group write one at a time, " +
 					"for APIs that reject parallel writes (the self-service purchase policies of the licensing API answer them " +
-					"with HTTP 412). The group covers the write, the reads after it until the values show up " +
-					"(`read_after_write_timeout`), and the request of `delete_method`. Reads on refresh are not serialized. " +
+					"with HTTP 412). The group covers the write request (including its retries) and the request of `delete_method`. " +
+					"Reads are not serialized: while one resource waits for its values to show up (`read_after_write_timeout`), " +
+					"the next one in the group already writes. " +
 					"The group holds within one provider process, that is, one provider configuration of one run; " +
 					"for writes from elsewhere, a 412 without a client precondition (`If-Match`, `If-None-Match`, " +
 					"`If-Unmodified-Since`) is retried. Changing it writes nothing.",
@@ -246,8 +247,9 @@ func (r *updateResource) write(ctx context.Context, m *updateResourceModel, diag
 		diags.AddError("Waiting for the concurrency group failed", err.Error())
 		return
 	}
-	defer release()
-
+	// The group covers the request and its retries, not the reads after it:
+	// those cannot collide, and the next write can go out while this one
+	// propagates.
 	_, err = r.client.Do(ctx, Request{
 		Method:   m.UpdateMethod.ValueString(),
 		URL:      m.URL.ValueString(),
@@ -255,6 +257,7 @@ func (r *updateResource) write(ctx context.Context, m *updateResourceModel, diag
 		Headers:  headers,
 		Body:     []byte(payload),
 	})
+	release()
 	if err != nil {
 		diags.AddError("Writing the object failed", err.Error())
 		return
