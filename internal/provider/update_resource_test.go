@@ -34,6 +34,7 @@ var testProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
 func init() {
 	pollInterval = 10 * time.Millisecond
 	retryConfig = retry.Config{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
+	conflictRetryConfig = retry.Config{MaxAttempts: 10, BaseDelay: time.Millisecond, MaxDelay: 5 * time.Millisecond}
 }
 
 const (
@@ -56,15 +57,17 @@ type recordedRequest struct {
 // the previous value for `lag` more GETs, like the eventually consistent
 // Microsoft APIs.
 type mockAPI struct {
-	mu        sync.Mutex
-	objects   map[string]map[string]any
-	stale     map[string]map[string]any
-	staleLeft map[string]int
-	lag       int
-	requests  []recordedRequest
-	failWith  string // if set, writes fail with this 400 body
-	throttle  int    // answer this many upcoming GETs with 429
-	throttled int    // number of 429s sent
+	mu         sync.Mutex
+	objects    map[string]map[string]any
+	stale      map[string]map[string]any
+	staleLeft  map[string]int
+	lag        int
+	requests   []recordedRequest
+	failWith   string // if set, writes fail with this 400 body
+	throttle   int    // answer this many upcoming GETs with 429
+	throttled  int    // number of 429s sent
+	conflicts  int    // answer this many upcoming writes with 412, like the licensing API's colliding writes
+	conflicted int    // number of 412s sent
 }
 
 func newMockAPI(t *testing.T) (*mockAPI, *httptest.Server) {
@@ -135,6 +138,13 @@ func (m *mockAPI) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(obj)
 	case http.MethodPatch, http.MethodPut:
+		if m.conflicts > 0 {
+			m.conflicts--
+			m.conflicted++
+			w.WriteHeader(http.StatusPreconditionFailed)
+			_, _ = io.WriteString(w, cosmosConflict)
+			return
+		}
 		if m.failWith != "" {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, m.failWith)
@@ -617,6 +627,213 @@ func TestUpdateResourceThrottledReadAfterWrite(t *testing.T) {
 					statecheck.ExpectKnownValue(plannerAddr, tfjsonpath.New("output").AtMapKey("sharing"), knownvalue.Bool(false)),
 				},
 			},
+		},
+	})
+}
+
+// Parallel writes to the licensing API collide on one Cosmos DB document and
+// fail with 412 without writing anything (#14). The provider retries them.
+func TestUpdateResourceConflictIsRetried(t *testing.T) {
+	api, srv := newMockAPI(t)
+	config := providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "purchase" {
+  count         = 2
+  url           = "%s%sP${count.index + 1}"
+  scope         = "aeb86249-8ea3-49e2-900b-54cc8e308f85/.default"
+  update_method = "PUT"
+  body          = { policyValue = "Disabled" }
+}
+`, srv.URL, purchaseBase)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { api.conflicts = 6 },
+				Config:    config,
+				Check: resource.ComposeTestCheckFunc(
+					api.checkValue(purchaseBase+"P1", "policyValue", "Disabled"),
+					api.checkValue(purchaseBase+"P2", "policyValue", "Disabled"),
+					func(*terraform.State) error {
+						api.mu.Lock()
+						defer api.mu.Unlock()
+						if api.conflicted != 6 {
+							return fmt.Errorf("%d writes were answered with 412, want 6", api.conflicted)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// With an If-Match header, 412 means the object changed: no retry, an error.
+func TestUpdateResourceConflictWithIfMatch(t *testing.T) {
+	api, srv := newMockAPI(t)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { api.conflicts = 1 },
+				Config: providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "purchase" {
+  url           = "%s%sP1"
+  update_method = "PUT"
+  headers       = { "If-Match" = "*" }
+  body          = { policyValue = "Disabled" }
+}
+`, srv.URL, purchaseBase),
+				// Only one 412 is queued, so a retry would have succeeded.
+				ExpectError: regexp.MustCompile(`PreconditionFailed\s+\(412\)`),
+			},
+		},
+	})
+}
+
+// writeTracker sits in front of the mock API and records how many writes (any
+// method but GET) are in flight at once. Each write is held for a moment so
+// that writes that are not serialized overlap. With barrier > 0, writes are
+// instead held until `barrier` writes were in flight at once (or 5 s passed).
+type writeTracker struct {
+	next    http.Handler
+	barrier int
+
+	mu                       sync.Mutex
+	active, maxActive, count int
+}
+
+func (w *writeTracker) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		w.next.ServeHTTP(rw, r)
+		return
+	}
+	w.mu.Lock()
+	w.active++
+	w.count++
+	w.maxActive = max(w.maxActive, w.active)
+	w.mu.Unlock()
+	if w.barrier > 0 {
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+			w.mu.Lock()
+			reached := w.maxActive >= w.barrier
+			w.mu.Unlock()
+			if reached {
+				break
+			}
+		}
+	} else {
+		time.Sleep(20 * time.Millisecond)
+	}
+	w.next.ServeHTTP(rw, r)
+	w.mu.Lock()
+	w.active--
+	w.mu.Unlock()
+}
+
+func (w *writeTracker) check(wantMax, wantCount int) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		if w.maxActive != wantMax || w.count != wantCount {
+			return fmt.Errorf("%d writes, at most %d at once; want %d writes, at most %d at once", w.count, w.maxActive, wantCount, wantMax)
+		}
+		return nil
+	}
+}
+
+func newTrackedMockAPI(t *testing.T, products, barrier int) (*mockAPI, *writeTracker, *httptest.Server) {
+	api, _ := newMockAPI(t)
+	for i := 1; i <= products; i++ {
+		api.objects[fmt.Sprintf("%sP%d", purchaseBase, i)] = map[string]any{"productId": fmt.Sprintf("P%d", i), "policyValue": "Enabled"}
+	}
+	tracker := &writeTracker{next: http.HandlerFunc(api.serve), barrier: barrier}
+	srv := httptest.NewServer(tracker)
+	t.Cleanup(srv.Close)
+	return api, tracker, srv
+}
+
+// Resources in the same concurrency group write one at a time, on create and
+// on destroy with delete_method.
+func TestUpdateResourceConcurrencySerializesWrites(t *testing.T) {
+	const n = 6
+	api, tracker, srv := newTrackedMockAPI(t, n, 0)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		CheckDestroy: resource.ComposeTestCheckFunc(
+			tracker.check(1, 2*n),
+			api.checkValue(purchaseBase+"P1", "policyValue", "Enabled"),
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "purchase" {
+  count         = %d
+  url           = "%s%sP${count.index + 1}"
+  update_method = "PUT"
+  body          = { policyValue = "Disabled" }
+  delete_method = "PUT"
+  delete_body   = { policyValue = "Enabled" }
+  concurrency   = "licensing"
+}
+`, n, srv.URL, purchaseBase),
+				Check: resource.ComposeTestCheckFunc(
+					tracker.check(1, n),
+					api.checkValue(purchaseBase+fmt.Sprintf("P%d", n), "policyValue", "Disabled"),
+				),
+			},
+		},
+	})
+}
+
+// Resources in different groups still write in parallel.
+func TestUpdateResourceConcurrencyGroupsAreIndependent(t *testing.T) {
+	_, tracker, srv := newTrackedMockAPI(t, 2, 2)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "purchase" {
+  count         = 2
+  url           = "%s%sP${count.index + 1}"
+  update_method = "PUT"
+  body          = { policyValue = "Disabled" }
+  concurrency   = "group-${count.index}"
+}
+`, srv.URL, purchaseBase),
+				Check: tracker.check(2, 2),
+			},
+		},
+	})
+}
+
+// concurrency is not part of the object: changing it alone writes nothing.
+func TestUpdateResourceConcurrencyChangeWritesNothing(t *testing.T) {
+	const addr = "msrest_update_resource.purchase"
+	_, tracker, srv := newTrackedMockAPI(t, 0, 0)
+	config := func(concurrency string) string {
+		return providerBlock + fmt.Sprintf(`
+resource "msrest_update_resource" "purchase" {
+  url           = "%s%sP1"
+  update_method = "PUT"
+  body          = { policyValue = "Disabled" }
+  response_export_values = { name = "productName" }
+  %s
+}
+`, srv.URL, purchaseBase, concurrency)
+	}
+	nameIsKept := []statecheck.StateCheck{
+		statecheck.ExpectKnownValue(addr, tfjsonpath.New("output").AtMapKey("name"), knownvalue.StringExact("Product 1")),
+	}
+	update := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+		plancheck.ExpectResourceAction(addr, plancheck.ResourceActionUpdate),
+	}}
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: config(`concurrency = "a"`), Check: tracker.check(1, 1)},
+			{Config: config(`concurrency = "b"`), Check: tracker.check(1, 1), ConfigPlanChecks: update, ConfigStateChecks: nameIsKept},
+			{Config: config(``), Check: tracker.check(1, 1), ConfigPlanChecks: update, ConfigStateChecks: nameIsKept},
 		},
 	})
 }

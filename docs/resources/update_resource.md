@@ -45,6 +45,10 @@ resource "msrest_update_resource" "self_service_purchase" {
   update_method = "PUT"
   body          = { policyValue = each.value }
 
+  # The licensing API answers parallel writes with HTTP 412, so write the
+  # products one at a time.
+  concurrency = "m365-licensing"
+
   # Optional: restore the default when the resource is destroyed.
   delete_method = "PUT"
   delete_body   = { policyValue = "Enabled" }
@@ -67,6 +71,7 @@ output "copilot_product_name" {
 
 ### Optional
 
+- `concurrency` (String) Name of a concurrency group: resources in the same group write one at a time, for APIs that reject parallel writes (the self-service purchase policies of the licensing API answer them with HTTP 412). The group covers the write, the reads after it until the values show up (`read_after_write_timeout`), and the request of `delete_method`. Reads on refresh are not serialized. The group holds within one provider process, that is, one provider configuration of one run; for writes from elsewhere, a 412 without a client precondition (`If-Match`, `If-None-Match`, `If-Unmodified-Since`) is retried. Changing it writes nothing.
 - `delete_body` (Dynamic) HCL object sent as JSON with `delete_method`, for example to restore defaults. Without it, the destroy request has no body.
 - `delete_method` (String) HTTP method sent to `url` on destroy: `DELETE`, `PATCH`, `PUT` or `POST`. When unset, destroying only removes the resource from the state and leaves the object as it is.
 - `headers` (Map of String) Additional request headers, sent with every request (for example `OData-Version`).
