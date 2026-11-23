@@ -8,8 +8,8 @@ checksum:
   require_checksum: true
 registries:
   - type: standard
-    ref: v4.589.0 # renovate: depName=aquaproj/aqua-registry
+    ref: v4.591.0 # renovate: depName=aquaproj/aqua-registry
 packages:
-  - name: goreleaser/goreleaser@v2.20.2
+  - name: goreleaser/goreleaser@v2.20.3
   - name: opentofu/opentofu@v1.13.9
   - name: hashicorp/terraform@v1.17.2
